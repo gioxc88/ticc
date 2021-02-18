@@ -47,49 +47,6 @@ def hex_to_rgb(value):
     return out
 
 
-def update_clusters(lle_node_vals, switch_penalty=1):
-    """
-    Takes in lle_node_vals matrix and computes the path that minimizes
-    the total cost over the path
-    Note the lle's are negative of the true lle's actually!!!!!
-
-    Note: switch penalty > 0
-    """
-    (T, num_clusters) = lle_node_vals.shape
-    future_cost_vals = np.zeros(lle_node_vals.shape)
-
-    # compute future costs
-    for i in range(T - 2, -1, -1):
-        j = i + 1
-        indicator = np.zeros(num_clusters)
-        future_costs = future_cost_vals[j, :]
-        lle_vals = lle_node_vals[j, :]
-        for cluster in range(num_clusters):
-            total_vals = future_costs + lle_vals + switch_penalty
-            total_vals[cluster] -= switch_penalty
-            future_cost_vals[i, cluster] = np.min(total_vals)
-
-    # compute the best path
-    path = np.zeros(T)
-
-    # the first location
-    curr_location = np.argmin(future_cost_vals[0, :] + lle_node_vals[0, :])
-    path[0] = curr_location
-
-    # compute the path
-    for i in range(T - 1):
-        j = i + 1
-        future_costs = future_cost_vals[j, :]
-        lle_vals = lle_node_vals[j, :]
-        total_vals = future_costs + lle_vals + switch_penalty
-        total_vals[int(path[i])] -= switch_penalty
-
-        path[i + 1] = np.argmin(total_vals)
-
-    # return the computed path
-    return path
-
-
 def find_matching(confusion_matrix):
     """
     returns the perfect matching

@@ -9,11 +9,6 @@ from sklearn.base import BaseEstimator
 
 from .utils import (
     upper_to_full,
-    get_train_test_split,
-    compute_bic,
-    compute_confusion_matrix,
-    find_matching,
-    update_clusters
 )
 from .admm import ADMM
 
@@ -68,250 +63,112 @@ class TICC(BaseEstimator):
         assert self.max_iters > 0  # must have at least one iteration
         self.log_parameters()
 
-        # Get data into proper format
-        times_series_arr = X
-        time_series_rows_size, time_series_col_size = times_series_arr.shape
-
-        # Train test split
-        # indices of the training samples
-        training_indices = get_train_test_split(time_series_rows_size, self.num_blocks, self.window_size)
-        num_train_points = len(training_indices)
-
         # Stack the training data
-        complete_D_train = self.stack_training_data(
-            times_series_arr,
-            num_train_points,
-            training_indices
-        )
+        X_stacked = self.stack_data(X)
 
         # Initialization
         # Gaussian Mixture
         gmm = mixture.GaussianMixture(n_components=self.n_clusters, covariance_type="full")
-        gmm.fit(complete_D_train)
-        clustered_points = gmm.predict(complete_D_train)
-        gmm_clustered_pts = clustered_points + 0
+        gmm.fit(X_stacked)
 
-        train_cluster_inverse = {}
-        log_det_values = {}  # log dets of the thetas
-        computed_covariance = {}
-        cluster_mean_info = {}
-        cluster_mean_stacked_info = {}
-        old_clustered_points = None  # points from last iteration
-
-        empirical_covariances = {}
+        history = dict(
+            clustered_points=gmm.predict(X_stacked),
+            old_clustered_points=None,  # points from last iteration
+            clustered_points_group=None,
+            cluster_mean={},
+            cluster_mean_stacked={},
+            opt_res=None,
+            computed_covariance={},
+            old_computed_covariance={},
+            empirical_covariances={},
+            train_cluster_inverse={},
+            log_det_values={},  # log dets of the thetas
+        )
 
         # PERFORM TRAINING ITERATIONS
-        for iter in range(self.max_iters):
+        for i in range(self.max_iters):
 
-            print("\n\n\nITERATION ###", iter)
-            # Get the train and test points
-            train_clusters_arr = defaultdict(list)  # {cluster: [point indices]}
-            for point, cluster_num in enumerate(clustered_points):
-                train_clusters_arr[cluster_num].append(point)
+            print("\n\n\nITERATION ###", i)
+            history['clustered_points_group'] = self.get_clustered_points_group(history['clustered_points'])
 
-            len_train_clusters = {k: len(v) for k, v in train_clusters_arr.items()}
-
-            # train_clusters holds the indices in complete_D_train
+            # train_clusters holds the indices in X_stacked
             # for each of the clusters
-            opt_res = self.train_clusters(
-                cluster_mean_info,
-                cluster_mean_stacked_info,
-                complete_D_train,
-                empirical_covariances,
-                len_train_clusters,
-                time_series_col_size,
-                train_clusters_arr
-            )
+            self.train_clusters(X_stacked, history)
 
-            self.optimize_clusters(
-                computed_covariance,
-                len_train_clusters,
-                log_det_values,
-                opt_res,
-                train_cluster_inverse
-            )
-
-            # update old computed covariance
-            old_computed_covariance = computed_covariance
-
+            self.optimize_clusters(history)
             print("UPDATED THE OLD COVARIANCE")
 
-            self.trained_model = {
-                'cluster_mean_info': cluster_mean_info,
-                'computed_covariance': computed_covariance,
-                'cluster_mean_stacked_info': cluster_mean_stacked_info,
-                'complete_D_train': complete_D_train,
-                'time_series_col_size': time_series_col_size
-            }
-            clustered_points = self.predict_clusters()
+            # history['clustered_points'] will be overwritten after I call self.update_clusters
+            history['old_clustered_points'] = history['clustered_points']
+            self.update_clusters(X_stacked, history)
 
-            # recalculate lengths
-            new_train_clusters = defaultdict(list)  # {cluster: [point indices]}
-            for point, cluster in enumerate(clustered_points):
-                new_train_clusters[cluster].append(point)
+            if i != 0:
+                # here I modify history['clustered_points']
+                self.reassign_empty_clusters(X_stacked, history)
 
-            len_new_train_clusters = {k: len(new_train_clusters[k]) for k in range(self.n_clusters)}
-            before_empty_cluster_assign = clustered_points.copy()
+            print('\n')
+            for cluster, cluster_indices in history['clustered_points_group'].items():
+                print(f'AFTER UPDATE length of the cluster {cluster} ------> {len(cluster_indices)}')
 
-            if iter != 0:
-                cluster_norms = [(np.linalg.norm(old_computed_covariance[self.n_clusters, i]), i) for i in
-                                 range(self.n_clusters)]
-                norms_sorted = sorted(cluster_norms, reverse=True)
-                # clusters that are not 0 as sorted by norm
-                valid_clusters = [cp[1] for cp in norms_sorted if len_new_train_clusters[cp[1]] != 0]
-
-                # Add a point to the empty clusters
-                # assuming more non empty clusters than empty ones
-                counter = 0
-                for cluster_num in range(self.n_clusters):
-                    if len_new_train_clusters[cluster_num] == 0:
-                        cluster_selected = valid_clusters[counter]  # a cluster that is not len 0
-                        counter = (counter + 1) % len(valid_clusters)
-                        print("cluster that is zero is:", cluster_num, "selected cluster instead is:", cluster_selected)
-                        start_point = np.random.choice(
-                            new_train_clusters[cluster_selected])  # random point number from that cluster
-                        for i in range(0, self.cluster_reassignment):
-                            # put cluster_reassignment points from point_num in this cluster
-                            point_to_move = start_point + i
-                            if point_to_move >= len(clustered_points):
-                                break
-                            clustered_points[point_to_move] = cluster_num
-                            computed_covariance[self.n_clusters, cluster_num] = old_computed_covariance[
-                                self.n_clusters, cluster_selected]
-                            cluster_mean_stacked_info[self.n_clusters, cluster_num] = complete_D_train[
-                                                                                      point_to_move, :]
-                            cluster_mean_info[self.n_clusters, cluster_num] \
-                                = complete_D_train[point_to_move, :][
-                                  (self.window_size - 1) * time_series_col_size:self.window_size * time_series_col_size]
-
-            for cluster_num in range(self.n_clusters):
-                print("length of cluster #", cluster_num, "-------->",
-                      sum([x == cluster_num for x in clustered_points]))
-
-            if np.array_equal(old_clustered_points, clustered_points):
+            if np.array_equal(history['old_clustered_points'], history['clustered_points']):
                 print("\n\n\n\nCONVERGED!!! BREAKING EARLY!!!")
                 break
-            old_clustered_points = before_empty_cluster_assign
-            # end of training
 
-        if self.compute_bic:
-            self.bic_ = compute_bic(
-                time_series_rows_size,
-                clustered_points,
-                train_cluster_inverse,
-                empirical_covariances
-            )
-
-        self.clustered_points_ = clustered_points
-        self.train_cluster_inverse_ = train_cluster_inverse
-        self.train_confusion_matrix_ = compute_confusion_matrix(self.n_clusters, clustered_points, training_indices)
-
+        # end of training
+        self.history_ = history
         return self
 
-    def compute_f_score(self, matching, train_confusion_matrix):
-        # doesn't return anything?
-        f1_tr = -1  # compute_f1_macro(train_confusion_matrix, matching, num_clusters)
+    def predict(self, X):
+        '''
 
-        print("\n\n")
-        print("TRAINING F1 score:", f1_tr)
-        correct = 0
-        for cluster in range(self.n_clusters):
-            matched_cluster = matching[cluster]
-            correct += train_confusion_matrix[cluster, matched_cluster]
+        :param X: {array-like, sparse matrix} of shape (n_samples, n_features) New data to predict.
+        :return labels: ndarray of shape (n_samples,). Index of the cluster each sample belongs to.
+        '''
 
-    def compute_matches(self, train_confusion_matrix):
-        matching = find_matching(train_confusion_matrix)
-        correct = 0
-        for cluster in range(self.n_clusters):
-            matched_cluster = matching[cluster]
-            correct += train_confusion_matrix[cluster, matched_cluster]
-        return matching
+        X_stacked = self.stack_data(X)
+        lle_all_points_clusters = self.smoothen_clusters(X_stacked, self.history_)
 
-    def smoothen_clusters(self, cluster_mean_info, computed_covariance, cluster_mean_stacked_info, complete_D_train, n):
-        clustered_points_len = len(complete_D_train)
-        inv_cov_dict = {}  # cluster to inv_cov
-        log_det_dict = {}  # cluster to log_det
-        for cluster in range(self.n_clusters):
-            cov_matrix = computed_covariance[self.n_clusters, cluster][0:(self.num_blocks - 1) * n,
-                         0:(self.num_blocks - 1) * n]
-            inv_cov_matrix = np.linalg.inv(cov_matrix)
-            log_det_cov = np.log(np.linalg.det(cov_matrix))  # log(det(sigma2|1))
-            inv_cov_dict[cluster] = inv_cov_matrix
-            log_det_dict[cluster] = log_det_cov
-        # For each point compute the LLE
-        print("beginning the smoothening ALGORITHM")
-        LLE_all_points_clusters = np.zeros([clustered_points_len, self.n_clusters])
-        for point in range(clustered_points_len):
-            if point + self.window_size - 1 < complete_D_train.shape[0]:
-                for cluster in range(self.n_clusters):
-                    cluster_mean = cluster_mean_info[self.n_clusters, cluster]
-                    cluster_mean_stacked = cluster_mean_stacked_info[self.n_clusters, cluster]
-                    x = complete_D_train[point, :] - cluster_mean_stacked[0:(self.num_blocks - 1) * n]
-                    inv_cov_matrix = inv_cov_dict[cluster]
-                    log_det_cov = log_det_dict[cluster]
-                    lle = np.dot(x.reshape([1, (self.num_blocks - 1) * n]),
-                                 np.dot(inv_cov_matrix, x.reshape([n * (self.num_blocks - 1), 1]))) + log_det_cov
-                    LLE_all_points_clusters[point, cluster] = lle
+        # Update cluster points - using NEW smoothening
+        return self._update_clusters(lle_all_points_clusters, switch_penalty=self.switch_penalty)
 
-        return LLE_all_points_clusters
+    def stack_data(self, X):
+        # re-implemented
+        n_samples, n_features = X.shape
+        # n_features_stacked = n_features * self.window_size
+        # X_stacked = np.concatenate([
+        #     x.reshape(1, -1) if (x := X[start:start + self.window_size].ravel()).shape[0] == n_features_stacked else
+        #     np.pad(x, (0, n_features_stacked - len(x)), 'constant', constant_values=0).reshape(1, -1)
+        #     for start in range(0, n_samples)
+        # ])
+        X_stacked = np.concatenate([X[start:start + self.window_size].reshape(1, -1)
+                                    for start in range(0, n_samples - self.window_size + 1)])
 
-    def optimize_clusters(
-            self,
-            computed_covariance,
-            len_train_clusters,
-            log_det_values,
-            opt_res,
-            train_cluster_inverse
-    ):
-        # opt_res contains only results for clusters with length != 0
+        return X_stacked
 
-        for cluster, val in opt_res.items():
-            print("OPTIMIZATION for Cluster #", cluster, "DONE!!!")
-            # THIS IS THE SOLUTION
-            S_est = upper_to_full(val, 0)
-            X2 = S_est
-            u, _ = np.linalg.eig(S_est)
-            cov_out = np.linalg.inv(X2)
+    def get_clustered_points_group(self, clustered_points):
+        return {cluster: np.flatnonzero([clustered_points == cluster]) for cluster in range(self.n_clusters)}
 
-            # Store the log-det, covariance, inverse-covariance, cluster means, stacked means
-            log_det_values[self.n_clusters, cluster] = np.log(np.linalg.det(cov_out))
-            computed_covariance[self.n_clusters, cluster] = cov_out
-            train_cluster_inverse[cluster] = X2
-        for cluster in range(self.n_clusters):
-            print("length of the cluster ", cluster, "------>", len_train_clusters[cluster])
-
-    def train_clusters(
-            self,
-            cluster_mean_info,
-            cluster_mean_stacked_info,
-            complete_D_train,
-            empirical_covariances,
-            len_train_clusters,
-            n_features,
-            train_clusters_arr
-    ):
+    def train_clusters(self, X_stacked, history,):
+        n_features_stacked = X_stacked.shape[1]
+        n_features = n_features_stacked // self.window_size
 
         solvers = {}
-        for cluster in range(self.n_clusters):
-            cluster_length = len_train_clusters[cluster]
-            if cluster_length != 0:
+        for cluster, indices in history['clustered_points_group'].items():
+            if (cluster_length := len(indices)) != 0:
                 block_size = n_features
-                indices = train_clusters_arr[cluster]
-                D_train = np.zeros([cluster_length, self.window_size * n_features])
+                x_cluster = np.zeros([cluster_length, n_features_stacked])
                 for i in range(cluster_length):
                     point = indices[i]
-                    D_train[i, :] = complete_D_train[point, :]
-
-                cluster_mean_info[self.n_clusters, cluster] = \
-                    np.mean(D_train, axis=0)[(self.window_size - 1) * n_features:
-                                             self.window_size * n_features].reshape([1, n_features])
-                cluster_mean_stacked_info[self.n_clusters, cluster] = np.mean(D_train, axis=0)
+                    x_cluster[i, :] = X_stacked[point, :]
 
                 # Fit a model - OPTIMIZATION
                 prob_size = self.window_size * block_size
                 lamb = np.zeros((prob_size, prob_size)) + self.lambda_parameter
-                S = np.cov(D_train, bias=self.biased, rowvar=False)
-                empirical_covariances[cluster] = S
+                S = np.cov(x_cluster, bias=self.biased, rowvar=False)
+
+                history['cluster_mean_stacked'][cluster] = np.mean(x_cluster, axis=0)
+                history['cluster_mean'][cluster] = history['cluster_mean_stacked'][cluster][-n_features:].reshape(1, -1)
+                history['empirical_covariances'][cluster] = S
 
                 rho = 1
                 solvers.setdefault(cluster, ADMM(
@@ -331,52 +188,139 @@ class TICC(BaseEstimator):
             ) for solver in solvers.values())
 
         opt_res = {k: v for k, v in zip(solvers, res)}
-        return opt_res
+        history['opt_res'] = opt_res
 
-    def stack_training_data(self, X, num_train_points, training_indices):
-        n = X.shape[1]
-        complete_D_train = np.zeros([num_train_points, self.window_size * n])
-        for i in range(num_train_points):
-            for k in range(self.window_size):
-                if i + k < num_train_points:
-                    idx_k = training_indices[i + k]
-                    complete_D_train[i][k * n:(k + 1) * n] = X[idx_k][0:n]
-        return complete_D_train
+    def optimize_clusters(self, history):
+        # opt_res contains only results for clusters with length != 0
+
+        for cluster, val in history['opt_res'].items():
+            # THIS IS THE SOLUTION
+            S_est = upper_to_full(val, 0)
+            X2 = S_est
+            u, _ = np.linalg.eig(S_est)
+            cov_out = np.linalg.inv(X2)
+
+            # Store the log-det, covariance, inverse-covariance, cluster means, stacked means
+            history['log_det_values'][cluster] = np.log(np.linalg.det(cov_out))
+            history['computed_covariance'][cluster] = cov_out
+            history['train_cluster_inverse'][cluster] = X2
+
+    def smoothen_clusters(self, X_stacked, history):
+        n_samples, n_features_stacked = X_stacked.shape
+
+        inv_cov_dict = {}  # cluster to inv_cov
+        log_det_dict = {}  # cluster to log_det
+
+        for cluster in range(self.n_clusters):
+            cov_matrix = history['computed_covariance'][cluster]
+            inv_cov_matrix = np.linalg.inv(cov_matrix)
+            log_det_cov = np.log(np.linalg.det(cov_matrix))  # log(det(sigma2|1))
+            inv_cov_dict[cluster] = inv_cov_matrix
+            log_det_dict[cluster] = log_det_cov
+        # For each point compute the LLE
+        print("beginning the smoothening ALGORITHM")
+
+        lle_all_points_clusters = np.zeros(shape=(n_samples, self.n_clusters))
+        for point in range(n_samples):
+            if point + self.window_size - 1 < X_stacked.shape[0]:
+                for cluster in range(self.n_clusters):
+                    cluster_mean_stacked = history['cluster_mean_stacked'][cluster]
+                    x = (X_stacked[point, :] - cluster_mean_stacked).reshape(-1, 1)
+                    inv_cov_matrix = inv_cov_dict[cluster]
+                    log_det_cov = log_det_dict[cluster]
+                    lle = x.T @ inv_cov_matrix @ x + log_det_cov
+                    lle_all_points_clusters[point, cluster] = lle
+
+        return lle_all_points_clusters
+
+    def update_clusters(self, X_stacked, history):
+        '''
+        Given the current trained model, predict clusters.  If the cluster segmentation has not been optimized yet,
+        than this will be part of the interative process.
+
+        Returns:
+            vector of predicted cluster for the points
+        '''
+
+        # SMOOTHENING
+        lle_all_points_clusters = self.smoothen_clusters(X_stacked, history)
+
+        # Update cluster points - using NEW smoothening
+        history['clustered_points'] = self._update_clusters(lle_all_points_clusters, switch_penalty=self.switch_penalty)
+
+    @staticmethod
+    def _update_clusters(lle_node_vals, switch_penalty=1):
+        (T, num_clusters) = lle_node_vals.shape
+        future_cost_vals = np.zeros(lle_node_vals.shape)
+
+        # compute future costs
+        for i in range(T - 2, -1, -1):
+            j = i + 1
+            future_costs = future_cost_vals[j, :]
+            lle_vals = lle_node_vals[j, :]
+            for cluster in range(num_clusters):
+                total_vals = future_costs + lle_vals + switch_penalty
+                total_vals[cluster] -= switch_penalty
+                future_cost_vals[i, cluster] = np.min(total_vals)
+
+        # compute the best path
+        path = np.zeros(T)
+
+        # the first location
+        curr_location = np.argmin(future_cost_vals[0, :] + lle_node_vals[0, :])
+        path[0] = curr_location
+
+        # compute the path
+        for i in range(T - 1):
+            j = i + 1
+            future_costs = future_cost_vals[j, :]
+            lle_vals = lle_node_vals[j, :]
+            total_vals = future_costs + lle_vals + switch_penalty
+            total_vals[int(path[i])] -= switch_penalty
+
+            path[i + 1] = np.argmin(total_vals)
+
+        # return the computed path
+        return path.astype(np.int32)
+
+    def reassign_empty_clusters(self, X_stacked, history):
+        n_features_stacked = X_stacked.shape[1]
+        n_features = n_features_stacked // self.window_size
+
+        cluster_norms = [(np.linalg.norm(cov), cluster)
+                         for cluster, cov in history['computed_covariance'].items()]
+
+        norms_sorted = sorted(cluster_norms, reverse=True)
+
+        # clusters that are not 0 as sorted by norm
+        valid_clusters = [cluster for norm, cluster in norms_sorted
+                          if history['clustered_points_group'][cluster].size]
+
+        # Add a point to the empty clusters
+        # assuming more non empty clusters than empty ones
+        counter = 0
+        for cluster in range(self.n_clusters):
+            if not history['clustered_points_group'][cluster].size:
+                cluster_selected = valid_clusters[counter]  # a cluster that is not len 0
+                counter = (counter + 1) % len(valid_clusters)
+                print("cluster that is zero is:", cluster, "selected cluster instead is:", cluster_selected)
+
+                # random point number from that cluster
+                start_point = np.random.choice(history['clustered_points_group'][cluster_selected])
+                for i in range(self.cluster_reassignment):
+                    # put cluster_reassignment points from point_num in this cluster
+                    point_to_move = start_point + i
+                    if point_to_move >= len(history['clustered_points']):
+                        break
+
+                    history['clustered_points'][point_to_move] = cluster
+                    history['clustered_points_group'][cluster] = np.flatnonzero([history['clustered_points'] == cluster])
+                    history['computed_covariance'][cluster] = history['computed_covariance'][cluster_selected]
+                    history['cluster_mean_stacked'][cluster] = X_stacked[point_to_move, :]
+                    history['cluster_mean'][cluster] = X_stacked[point_to_move, -n_features:]
 
     def log_parameters(self):
         print("lam_sparse", self.lambda_parameter)
         print("switch_penalty", self.switch_penalty)
         print("num_cluster", self.n_clusters)
         print("num stacked", self.window_size)
-
-    def predict_clusters(self, test_data=None):
-        '''
-        Given the current trained model, predict clusters.  If the cluster segmentation has not been optimized yet,
-        than this will be part of the interative process.
-
-        Args:
-            numpy array of data for which to predict clusters.  Columns are dimensions of the data, each row is
-            a different timestamp
-
-        Returns:
-            vector of predicted cluster for the points
-        '''
-        if test_data is not None:
-            if not isinstance(test_data, np.ndarray):
-                raise TypeError("input must be a numpy array!")
-        else:
-            test_data = self.trained_model['complete_D_train']
-
-        # SMOOTHENING
-        lle_all_points_clusters = self.smoothen_clusters(
-            self.trained_model['cluster_mean_info'],
-            self.trained_model['computed_covariance'],
-            self.trained_model['cluster_mean_stacked_info'],
-            test_data,
-            self.trained_model['time_series_col_size']
-        )
-
-        # Update cluster points - using NEW smoothening
-        clustered_points = update_clusters(lle_all_points_clusters, switch_penalty=self.switch_penalty)
-
-        return clustered_points

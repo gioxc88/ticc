@@ -1,6 +1,6 @@
 # Toeplitz Inverse Covariance Clustering (TICC)
-A `sklearn` compatible implementation of the TICC algorithm.
-All credits to go the author. You can find the original repo [here](https://github.com/davidhallac/TICC)
+A `sklearn` compatible implementation of the TICC algorithm.  
+All credits to go the author. You can find the original repo [here](https://github.com/davidhallac/TICC).   
 TICC is a python solver for efficiently segmenting and clustering a multivariate time series. 
 It takes as input a T-by-n data matrix, a regularization parameter `lambda` and smoothness parameter `beta`, 
 the window size `w` and the number of clusters `k`.  

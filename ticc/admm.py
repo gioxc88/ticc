@@ -4,11 +4,11 @@ from .utils import upper_to_full
 
 
 class ADMM:
-    def __init__(self, lamb, num_stacked, block_size, rho, S, rho_update_func=None):
+    def __init__(self, lamb, n_blocks, block_size, rho, S, rho_update_func=None):
         self.lamb = lamb
-        self.n_blocks = num_stacked
+        self.n_blocks = n_blocks
         self.block_size = block_size
-        prob_size = num_stacked * block_size
+        prob_size = n_blocks * block_size
         self.length = int(prob_size * (prob_size + 1) / 2)
         self.x = np.zeros(self.length)
         self.z = np.zeros(self.length)
@@ -128,4 +128,5 @@ class ADMM:
             if verbose:
                 # Debugging information prints current iteration #
                 print('Iteration %d' % i)
-        return self.x
+
+        return self

@@ -8,19 +8,31 @@ class ADMM:
         self.lamb = lamb
         self.n_blocks = n_blocks
         self.block_size = block_size
-        prob_size = n_blocks * block_size
-        self.length = int(prob_size * (prob_size + 1) / 2)
+        self.rho = float(rho)
+        self.S = S
+        self.rho_update_func = rho_update_func
+        self.status = None
+        self.x = None
+        self.z = None
+        self.u = None
+
+    @property
+    def prob_size(self):
+        return self.n_blocks * self.block_size
+
+    @property
+    def length(self):
+        return int(self.prob_size * (self.prob_size + 1) / 2)
+
+    def initialize(self):
         self.x = np.zeros(self.length)
         self.z = np.zeros(self.length)
         self.u = np.zeros(self.length)
-        self.rho = float(rho)
-        self.S = S
-        self.status = 'initialized'
-        self.rho_update_func = rho_update_func
+        self.status = 'Initialized'
 
     @staticmethod
     def ij_to_symmetric(i, j, size):
-        return (size * (size + 1)) / 2 - (size - i) * (size - i + 1) / 2 + j - i
+        return int((size * (size + 1)) / 2 - (size - i) * (size - i + 1) / 2 + j - i)
 
     @staticmethod
     def prox_logdet(S, A, eta):
@@ -44,10 +56,9 @@ class ADMM:
 
         # TODO: can we parallelize these?
         for i in range(self.n_blocks):
-            elems = self.n_blocks if i == 0 else (2 * self.n_blocks - 2 * i) / 2  # i=0 is diagonal
+            elems = (2 * self.n_blocks - 2 * i) / 2 if i else self.n_blocks  # i=0 is diagonal
             for j in range(self.block_size):
-                start_point = j if i == 0 else 0
-                for k in range(start_point, self.block_size):
+                for k in range(0 if i else j, self.block_size):
                     loc_list = [((l + i) * self.block_size + j, l * self.block_size + k) for l in range(int(elems))]
                     if i == 0:
                         lam_sum = sum(self.lamb[loc1, loc2] for (loc1, loc2) in loc_list)
@@ -55,7 +66,8 @@ class ADMM:
                     else:
                         lam_sum = sum(self.lamb[loc2, loc1] for (loc1, loc2) in loc_list)
                         indices = [self.ij_to_symmetric(loc2, loc1, prob_size) for (loc1, loc2) in loc_list]
-                    point_sum = sum(a[int(index)] for index in indices)
+
+                    point_sum = a[indices].sum()
                     rho_point_sum = self.rho * point_sum
 
                     # Calculate soft threshold
@@ -66,8 +78,7 @@ class ADMM:
                     elif rho_point_sum < -1 * lam_sum:
                         ans = min((rho_point_sum + lam_sum) / (self.rho * elems), 0)
 
-                    for index in indices:
-                        z_update[int(index)] = ans
+                    z_update[indices] = ans
         self.z = z_update
 
     def update_u(self):
@@ -102,10 +113,9 @@ class ADMM:
         stop = (res_pri <= e_pri) and (res_dual <= e_dual)
         return stop, res_pri, e_pri, res_dual, e_dual
 
-    # solve
     def run(self, max_iters, eps_abs, eps_rel, verbose):
-        num_iterations = 0
-        self.status = 'Incomplete: max iterations reached'
+        self.initialize()
+
         for i in range(max_iters):
             z_old = np.copy(self.z)
             self.update_x()
@@ -115,7 +125,7 @@ class ADMM:
                 stop, res_pri, e_pri, res_dual, e_dual = self.check_convergence(z_old, eps_abs, eps_rel, verbose)
                 if stop:
                     self.status = 'Optimal'
-                    break
+                    return self
 
                 if self.rho_update_func:
                     new_rho = self.rho_update_func(self.rho, res_pri, e_pri, res_dual, e_dual)
@@ -129,4 +139,6 @@ class ADMM:
                 # Debugging information prints current iteration #
                 print('Iteration %d' % i)
 
+        self.status = 'Incomplete: max iterations reached'
         return self
+

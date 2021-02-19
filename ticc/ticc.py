@@ -5,7 +5,7 @@ import pandas as pd
 
 from joblib import delayed, Parallel
 from sklearn import mixture
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, ClusterMixin
 
 from .utils import (
     upper_to_full,
@@ -13,7 +13,7 @@ from .utils import (
 from .admm import ADMM
 
 
-class TICC(BaseEstimator):
+class TICC(ClusterMixin, BaseEstimator):
     def __init__(
             self,
             window_size=10,
@@ -25,13 +25,14 @@ class TICC(BaseEstimator):
             compute_bic=False,
             cluster_reassignment=20,
             biased=False,
-            n_jobs = None,
+            verbose=0,
+            n_jobs=None,
     ):
         '''
-        All the methods that accepts X as inputs, except for fit and predict
-        expect the X_stacked data as described in the paper:
-
+        Refactoring of the TICC algorithm written by David Hallac and descirbed in the paper:
         https://stanford.edu/~boyd/papers/pdf/ticc.pdf
+
+        Original repo:
 
         :param window_size: size of the sliding window
         :param n_clusters: number of clusters
@@ -41,6 +42,7 @@ class TICC(BaseEstimator):
         :param threshold: convergence threshold
         :param cluster_reassignment: number of points to reassign to a 0 cluster
         :param biased: Using the biased or the unbiased covariance
+        :param varbose: int, level of verbosity
         :param n_jobs: number of processe to spawn
         '''
 
@@ -55,31 +57,33 @@ class TICC(BaseEstimator):
         self.num_blocks = self.window_size + 1
         self.biased = biased
         self.n_jobs = n_jobs
+        self.verbose = verbose
 
         pd.set_option('display.max_columns', 500)
         np.set_printoptions(formatter={'float': lambda x: "{0:0.4f}".format(x)})
         np.random.seed(102)
 
-    def fit(self, X, y=None):
+    def fit(self, X, y=None, **fit_params):
+        X_stacked = self.stack_data(X)
+        return self._fit(X_stacked)
+
+    def _fit(self, X_stacked):
+        # re-implemented
         '''
-        The fit method is basically a variation of the EM algo
-        :param X:
-        :param y:
-        :return:
+        Main fitting function which represents a variation of the EM algorithm
+        Expects the X_stacked data as described in the paper of shape
+        (n_samples - self.window_size + 1, n_features * self.window_size)
+
+        :param X_stacked:
+        :return: self
         '''
         assert self.max_iters > 0  # must have at least one iteration
-        self.log_parameters()
-
-        # Stack the training data
-        X_stacked = self.stack_data(X)
 
         # Initialization
         # Gaussian Mixture
         gmm = mixture.GaussianMixture(n_components=self.n_clusters, covariance_type="full")
         gmm.fit(X_stacked)
-
         labels = gmm.predict(X_stacked)
-        # points from last iteration
 
         # PERFORM TRAINING ITERATIONS
         for i in range(self.max_iters):
@@ -96,7 +100,7 @@ class TICC(BaseEstimator):
             labels = self.e_step(X_stacked, labels=labels, thetas=thetas)
 
             # 3. Reassign a few points to empty clusters
-            labels = self.reassign_empty_clusters(X_stacked, labels, thetas)
+            labels = self.reassign_empty_clusters(labels, thetas)
 
             print('\n')
             for cluster, cluster_indices in self.get_all_clusters_indices(labels).items():
@@ -114,7 +118,6 @@ class TICC(BaseEstimator):
 
     def predict(self, X):
         '''
-
         :param X: {array-like, sparse matrix} of shape (n_samples, n_features) New data to predict.
         :return labels: ndarray of shape (n_samples,). Index of the cluster each sample belongs to.
         '''
@@ -122,15 +125,14 @@ class TICC(BaseEstimator):
         X_stacked = self.stack_data(X)
         return self.e_step(X_stacked, self.labels_, self.thetas_)
 
+    def fit_predict(self, X, y=None):
+        X_stacked = self.stack_data(X)
+        self._fit(X_stacked)
+        return self.e_step(X_stacked, self.labels_, self.thetas_)
+
     def stack_data(self, X):
         # re-implemented
         n_samples, n_features = X.shape
-        # n_features_stacked = n_features * self.window_size
-        # X_stacked = np.concatenate([
-        #     x.reshape(1, -1) if (x := X[start:start + self.window_size].ravel()).shape[0] == n_features_stacked else
-        #     np.pad(x, (0, n_features_stacked - len(x)), 'constant', constant_values=0).reshape(1, -1)
-        #     for start in range(0, n_samples)
-        # ])
         X_stacked = np.concatenate([X[start:start + self.window_size].reshape(1, -1)
                                     for start in range(0, n_samples - self.window_size + 1)])
 
@@ -185,6 +187,7 @@ class TICC(BaseEstimator):
         return {cluster: upper_to_full(solver.x, 0) for cluster, solver in zip(solvers, res)}
 
     def e_step(self, X_stacked, labels, thetas):
+        # re-implemented
         '''
         The e-step calculates the lle for each sample i and each cluster j
         (probability that n-dimensional sample i belongs to cluster j) and uses this matrix to update the clusters
@@ -216,6 +219,7 @@ class TICC(BaseEstimator):
         for cluster in range(self.n_clusters):
             cluster_indices = self.get_cluster_indices(labels, cluster)
             inv_cov = thetas[cluster]
+
             # if B = inv(A) then det(B) = 1 / det(A) => log(det(A)) = log(1 / det(B)) = - log(det(B))
             log_det_cov = - np.log(np.linalg.det(inv_cov))
             cluster_mean = X_stacked[cluster_indices].mean(axis=0)
@@ -259,12 +263,10 @@ class TICC(BaseEstimator):
         # return the computed path
         return path.astype(np.int32)
 
-    def reassign_empty_clusters(self, X_stacked, labels, thetas):
-        n_features_stacked = X_stacked.shape[1]
-        # n_features = n_features_stacked // self.window_size
-
+    def reassign_empty_clusters(self, labels, thetas):
         cluster_norms = [(np.linalg.norm(np.linalg.inv(theta)), cluster) for cluster, theta in thetas.items()]
         norms_sorted = sorted(cluster_norms, reverse=True)
+
         # clusters that are not 0 as sorted by norm
         all_cluster_indices = self.get_all_clusters_indices(labels)
         valid_clusters = [cluster for norm, cluster in norms_sorted if all_cluster_indices[cluster].size]
@@ -287,9 +289,3 @@ class TICC(BaseEstimator):
                     break
                 labels[point_to_move] = cluster
         return labels
-
-    def log_parameters(self):
-        print("lam_sparse", self.lambda_parameter)
-        print("switch_penalty", self.switch_penalty)
-        print("num_cluster", self.n_clusters)
-        print("num stacked", self.window_size)

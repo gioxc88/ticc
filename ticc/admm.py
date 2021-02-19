@@ -1,7 +1,5 @@
 import numpy as np
 
-from .utils import upper_to_full
-
 
 class ADMM:
     def __init__(self, lamb, n_blocks, block_size, rho, S, rho_update_func=None):
@@ -24,6 +22,10 @@ class ADMM:
     def length(self):
         return int(self.prob_size * (self.prob_size + 1) / 2)
 
+    @property
+    def theta(self):
+        return self.upper_to_full(self.x, eps=0)
+
     def initialize(self):
         self.x = np.zeros(self.length)
         self.z = np.zeros(self.length)
@@ -35,6 +37,18 @@ class ADMM:
         return int((size * (size + 1)) / 2 - (size - i) * (size - i + 1) / 2 + j - i)
 
     @staticmethod
+    def upper_to_full(a, eps=0):
+        if eps is not None:
+            mask = (a < eps) & (a > -eps)
+            a[mask] = 0
+        n = int((-1 + np.sqrt(1 + 8 * a.shape[0])) / 2)
+        A = np.zeros([n, n])
+        A[np.triu_indices(n)] = a
+        temp = A.diagonal()
+        A = np.asarray((A + A.T) - np.diag(temp))
+        return A
+
+    @staticmethod
     def prox_logdet(S, A, eta):
         d, q = np.linalg.eigh(eta * A - S)
         q = np.matrix(q)
@@ -44,7 +58,7 @@ class ADMM:
 
     def update_x(self):
         a = self.z - self.u
-        A = upper_to_full(a, eps=None)
+        A = self.upper_to_full(a, eps=None)
         eta = self.rho
         x_update = self.prox_logdet(self.S, A, eta)
         self.x = np.array(x_update).T.reshape(-1)

@@ -1,4 +1,4 @@
-from collections import defaultdict
+from functools import wraps
 
 import numpy as np
 import pandas as pd
@@ -7,10 +7,21 @@ from joblib import delayed, Parallel
 from sklearn import mixture
 from sklearn.base import BaseEstimator, ClusterMixin
 
-from .utils import (
-    upper_to_full,
-)
 from .admm import ADMM
+
+
+def pandas_handler(fn):
+    @wraps(fn)
+    def wrapper(self, X, *args, **kwargs):
+        if isinstance(X, (pd.Series, pd.DataFrame)):
+            X = pd.DataFrame(X)
+            self.feature_names_ = X.columns
+            X = X.to_numpy()
+        elif not isinstance(X, np.ndarray):
+            raise ValueError('Data type not supported')
+
+        return fn(self, X, *args, **kwargs)
+    return wrapper
 
 
 class TICC(ClusterMixin, BaseEstimator):
@@ -59,10 +70,7 @@ class TICC(ClusterMixin, BaseEstimator):
         self.n_jobs = n_jobs
         self.verbose = verbose
 
-        pd.set_option('display.max_columns', 500)
-        np.set_printoptions(formatter={'float': lambda x: "{0:0.4f}".format(x)})
-        np.random.seed(102)
-
+    @pandas_handler
     def fit(self, X, y=None, **fit_params):
         X_stacked = self.stack_data(X)
         return self._fit(X_stacked)
@@ -87,35 +95,40 @@ class TICC(ClusterMixin, BaseEstimator):
 
         # PERFORM TRAINING ITERATIONS
         for i in range(self.max_iters):
-            # assuming gaussian mixture initialization always returns at least one point per cluster
-            print("\n\n\nITERATION ###", i)
-
+            # Assuming gaussian mixture initialization always returns at least one point per cluster
             # 1. M-step runs the Toeplitz Graphical Lasso and updates the inverse covariance matrices for each cluster.
-            #    the m-steps also updates the history with
-            thetas = self.m_step(X_stacked, labels=labels)
-            print("UPDATED THE OLD COVARIANCE")
+            thetas, means = self.m_step(X_stacked, labels=labels)
 
             # 2. E-step updates the cluster assignment keeping the inverse covariances fixed
             old_labels = labels.copy()
-            labels = self.e_step(X_stacked, labels=labels, thetas=thetas)
+            labels = self.e_step(X_stacked, thetas=thetas, means=means)
+
+            if self.verbose:
+                print(f'\nIteration {i}/{self.max_iters}')
+                for cluster, cluster_indices in self.get_cluster_indices(labels).items():
+                    print(f'\tlength of cluster {cluster} => {len(cluster_indices)}')
+
+            # BREAK CONDITION
+            if np.array_equal(old_labels, labels):
+                break
 
             # 3. Reassign a few points to empty clusters
             labels = self.reassign_empty_clusters(labels, thetas)
 
-            print('\n')
-            for cluster, cluster_indices in self.get_all_clusters_indices(labels).items():
-                print(f'AFTER UPDATE length of the cluster {cluster} ------> {len(cluster_indices)}')
-
-            # I believe this condition should go before the cluster reassignment
-            if np.array_equal(old_labels, labels):
-                print("\n\n\n\nCONVERGED!!! BREAKING EARLY!!!")
-                break
+            if i == self.max_iters - 1:
+                # logic: if I hit the previous break condition it means that the e-step didn't modify the labels
+                #        hence I don't need to recalculate means and clustered_indices as they are still valid
+                clustered_indices = self.get_cluster_indices(labels)
+                means = {cluster: X_stacked[cluster_indices].mean() for cluster, cluster_indices in clustered_indices}
 
         # end of training
-        self.labels_ = labels
+        # assigning first self.window_size - 1 observations to the first cluster
+        self.labels_ = self.finalize_labels(labels)
         self.thetas_ = thetas
+        self.means_ = means
         return self
 
+    @pandas_handler
     def predict(self, X):
         '''
         :param X: {array-like, sparse matrix} of shape (n_samples, n_features) New data to predict.
@@ -123,7 +136,8 @@ class TICC(ClusterMixin, BaseEstimator):
         '''
 
         X_stacked = self.stack_data(X)
-        return self.e_step(X_stacked, self.labels_, self.thetas_)
+        labels = self.e_step(X_stacked, self.thetas_, self.means_)
+        return self.finalize_labels(labels)
 
     def fit_predict(self, X, y=None):
         X_stacked = self.stack_data(X)
@@ -138,42 +152,41 @@ class TICC(ClusterMixin, BaseEstimator):
 
         return X_stacked
 
-    def get_all_clusters_indices(self, labels):
-        return {cluster: np.flatnonzero([labels == cluster]) for cluster in range(self.n_clusters)}
+    def finalize_labels(self, labels):
+        return np.concatenate((np.full(diff, labels[0]), labels)) if (diff := (self.window_size - 1)) else labels
 
-    @staticmethod
-    def get_cluster_indices(labels, cluster):
-        return np.flatnonzero([labels == cluster])
+    def get_cluster_indices(self, labels=None):
+        labels = labels if labels is not None else self.labels_
+        return {cluster: np.flatnonzero([labels == cluster]) for cluster in range(self.n_clusters)}
 
     def m_step(self, X_stacked, labels):
         '''
         The M-step corresponds to solving the Toeplitz Graphical Lasso which updates the inverse covariances
         :param X_stacked:
-        :param history:
+        :param clustered_indices:
         :return:
         '''
         n_features_stacked = X_stacked.shape[1]
         n_features = n_features_stacked // self.window_size
 
         solvers = {}
-        for cluster in range(self.n_clusters):
-            cluster_indices = self.get_cluster_indices(labels, cluster)
+        means = {}
+        for cluster, cluster_indices in self.get_cluster_indices(labels).items():
+            x_cluster = X_stacked[cluster_indices]
+            block_size = n_features
+            prob_size = self.window_size * block_size
+            lamb = np.zeros((prob_size, prob_size)) + self.lambda_parameter
+            S = np.cov(x_cluster, bias=self.biased, rowvar=False)
+            means[cluster] = x_cluster.mean(axis=0)
 
-            if cluster_indices.size:
-                x_cluster = X_stacked[cluster_indices]
-                block_size = n_features
-                prob_size = self.window_size * block_size
-                lamb = np.zeros((prob_size, prob_size)) + self.lambda_parameter
-                S = np.cov(x_cluster, bias=self.biased, rowvar=False)
-
-                rho = 1
-                solvers.setdefault(cluster, ADMM(
-                    lamb=lamb,
-                    n_blocks=self.window_size,
-                    block_size=block_size,
-                    rho=rho,
-                    S=S
-                ))
+            rho = 1
+            solvers.setdefault(cluster, ADMM(
+                lamb=lamb,
+                n_blocks=self.window_size,
+                block_size=block_size,
+                rho=rho,
+                S=S
+            ))
 
         res = Parallel(n_jobs=self.n_jobs)(
             delayed(solver.run)(
@@ -184,9 +197,9 @@ class TICC(ClusterMixin, BaseEstimator):
             ) for solver in solvers.values())
 
         # this returns the updated inverse covariance matrices for each cluster
-        return {cluster: upper_to_full(solver.x, 0) for cluster, solver in zip(solvers, res)}
+        return {cluster: solver.theta for cluster, solver in zip(solvers, res)}, means
 
-    def e_step(self, X_stacked, labels, thetas):
+    def e_step(self, X_stacked, thetas, means):
         # re-implemented
         '''
         The e-step calculates the lle for each sample i and each cluster j
@@ -198,12 +211,12 @@ class TICC(ClusterMixin, BaseEstimator):
         '''
 
         # SMOOTHENING
-        smooth_lle = self.smoothen_lle(X_stacked, labels=labels, thetas=thetas)
+        smooth_lle = self.smoothen_lle(X_stacked, thetas=thetas, means=means)
 
         # Update cluster points - using NEW smoothening
         return self.update_clusters(smooth_lle, switch_penalty=self.switch_penalty)
 
-    def smoothen_lle(self, X_stacked, labels, thetas):
+    def smoothen_lle(self, X_stacked, thetas, means):
         # re-implemented
         '''
         This function calculates the lle given a fixed covariance matrices updated during the m-step
@@ -214,15 +227,12 @@ class TICC(ClusterMixin, BaseEstimator):
                  the point i (which is n-dimensional according to n_features) belongs to cluster j
         '''
         n_samples, n_features_stacked = X_stacked.shape
-        print("beginning the smoothening ALGORITHM")
         lle = np.zeros(shape=(n_samples, self.n_clusters))
         for cluster in range(self.n_clusters):
-            cluster_indices = self.get_cluster_indices(labels, cluster)
             inv_cov = thetas[cluster]
-
+            cluster_mean = means[cluster]
             # if B = inv(A) then det(B) = 1 / det(A) => log(det(A)) = log(1 / det(B)) = - log(det(B))
             log_det_cov = - np.log(np.linalg.det(inv_cov))
-            cluster_mean = X_stacked[cluster_indices].mean(axis=0)
             X_centered = X_stacked - cluster_mean
             lle[:, cluster] = ((X_centered @ inv_cov) * X_centered).sum(axis=1) + log_det_cov
         return lle
@@ -268,7 +278,7 @@ class TICC(ClusterMixin, BaseEstimator):
         norms_sorted = sorted(cluster_norms, reverse=True)
 
         # clusters that are not 0 as sorted by norm
-        all_cluster_indices = self.get_all_clusters_indices(labels)
+        all_cluster_indices = self.get_cluster_indices(labels)
         valid_clusters = [cluster for norm, cluster in norms_sorted if all_cluster_indices[cluster].size]
         empty_clusters = [c for c in all_cluster_indices if c not in valid_clusters]
 
@@ -278,7 +288,9 @@ class TICC(ClusterMixin, BaseEstimator):
         for cluster in empty_clusters:
             cluster_selected = valid_clusters[counter]  # a cluster that is not len 0
             counter = (counter + 1) % len(valid_clusters)
-            print("cluster that is zero is:", cluster, "selected cluster instead is:", cluster_selected)
+
+            if self.verbose:
+                print(f"\tCluster {cluster} has 0 elements. Reassigning from cluster {cluster_selected}")
 
             # random point number from that cluster
             start_point = np.random.choice(all_cluster_indices[cluster_selected])

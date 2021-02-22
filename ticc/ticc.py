@@ -33,9 +33,9 @@ class TICC(ClusterMixin, BaseEstimator):
             switch_penalty=400,
             max_iters=1000,
             threshold=2e-5,
-            compute_bic=False,
             cluster_reassignment=20,
             biased=False,
+            fill_labels=None,
             verbose=0,
             n_jobs=None,
     ):
@@ -53,7 +53,8 @@ class TICC(ClusterMixin, BaseEstimator):
         :param threshold: convergence threshold
         :param cluster_reassignment: number of points to reassign to a 0 cluster
         :param biased: Using the biased or the unbiased covariance
-        :param varbose: int, level of verbosity
+        :param fill_labels: None or 'first', how to fill the initial labels that are lost due to the window_Size effect
+        :param verbose: int, level of verbosity
         :param n_jobs: number of processe to spawn
         '''
 
@@ -63,16 +64,18 @@ class TICC(ClusterMixin, BaseEstimator):
         self.switch_penalty = switch_penalty
         self.max_iters = max_iters
         self.threshold = threshold
-        self.compute_bic = compute_bic
         self.cluster_reassignment = cluster_reassignment
         self.num_blocks = self.window_size + 1
         self.biased = biased
         self.n_jobs = n_jobs
         self.verbose = verbose
+        self.fill_labels = fill_labels
 
     @pandas_handler
     def fit(self, X, y=None, **fit_params):
         X_stacked = self.stack_data(X)
+        self.X_last_ = X[-self.window_size+1:] if self.window_size > 1 else None
+
         return self._fit(X_stacked)
 
     def _fit(self, X_stacked):
@@ -101,12 +104,7 @@ class TICC(ClusterMixin, BaseEstimator):
 
             # 2. E-step updates the cluster assignment keeping the inverse covariances fixed
             old_labels = labels.copy()
-            labels = self.e_step(X_stacked, thetas=thetas, means=means)
-
-            if self.verbose:
-                print(f'\nIteration {i}/{self.max_iters}')
-                for cluster, cluster_indices in self.get_cluster_indices(labels).items():
-                    print(f'\tlength of cluster {cluster} => {len(cluster_indices)}')
+            labels, lle = self.e_step(X_stacked, thetas=thetas, means=means)
 
             # BREAK CONDITION
             if np.array_equal(old_labels, labels):
@@ -120,29 +118,39 @@ class TICC(ClusterMixin, BaseEstimator):
                 #        hence I don't need to recalculate means and clustered_indices as they are still valid
                 clustered_indices = self.get_cluster_indices(labels)
                 means = {cluster: X_stacked[cluster_indices].mean() for cluster, cluster_indices in clustered_indices}
+                lle = self.smoothen_lle(X_stacked, thetas=thetas, means=means)
+
+            if self.verbose:
+                print(f'\nIteration {i}/{self.max_iters}')
+                for cluster, cluster_indices in self.get_cluster_indices(labels).items():
+                    print(f'\t AFTER: length of cluster {cluster} => {len(cluster_indices)}')
 
         # end of training
         # assigning first self.window_size - 1 observations to the first cluster
         self.labels_ = self.finalize_labels(labels)
         self.thetas_ = thetas
         self.means_ = means
+        self.lle_ = lle
         return self
 
     @pandas_handler
     def predict(self, X):
         '''
+        Assumes that test data starts right after the end of training data
         :param X: {array-like, sparse matrix} of shape (n_samples, n_features) New data to predict.
         :return labels: ndarray of shape (n_samples,). Index of the cluster each sample belongs to.
         '''
+        X_test = np.concatenate([self.X_last_, X]) if self.window_size > 1 else X
+        X_stacked = self.stack_data(X_test)
 
-        X_stacked = self.stack_data(X)
-        labels = self.e_step(X_stacked, self.thetas_, self.means_)
-        return self.finalize_labels(labels)
+        lle = np.concatenate([self.lle_, self.smoothen_lle(X_stacked, thetas=self.thetas_, means=self.means_)])
+        labels = self.update_clusters(lle, self.switch_penalty)
+        return labels[-len(X):]
 
     def fit_predict(self, X, y=None):
         X_stacked = self.stack_data(X)
         self._fit(X_stacked)
-        return self.e_step(X_stacked, self.labels_, self.thetas_)
+        return self.labels_
 
     def stack_data(self, X):
         # re-implemented
@@ -153,7 +161,8 @@ class TICC(ClusterMixin, BaseEstimator):
         return X_stacked
 
     def finalize_labels(self, labels):
-        return np.concatenate((np.full(diff, labels[0]), labels)) if (diff := (self.window_size - 1)) else labels
+        value = labels[0] if self.fill_labels else np.nan
+        return np.concatenate((np.full(diff, value), labels)) if (diff := (self.window_size - 1)) else labels
 
     def get_cluster_indices(self, labels=None):
         labels = labels if labels is not None else self.labels_
@@ -214,7 +223,7 @@ class TICC(ClusterMixin, BaseEstimator):
         smooth_lle = self.smoothen_lle(X_stacked, thetas=thetas, means=means)
 
         # Update cluster points - using NEW smoothening
-        return self.update_clusters(smooth_lle, switch_penalty=self.switch_penalty)
+        return self.update_clusters(smooth_lle, switch_penalty=self.switch_penalty), smooth_lle
 
     def smoothen_lle(self, X_stacked, thetas, means):
         # re-implemented
@@ -226,6 +235,7 @@ class TICC(ClusterMixin, BaseEstimator):
         :return: lle matrix of shape len(X_stacked), self.n_cluster where each entry lle(i, j) is the probability that
                  the point i (which is n-dimensional according to n_features) belongs to cluster j
         '''
+
         n_samples, n_features_stacked = X_stacked.shape
         lle = np.zeros(shape=(n_samples, self.n_clusters))
         for cluster in range(self.n_clusters):

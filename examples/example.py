@@ -14,7 +14,7 @@ fname = path / 'data/data.txt'
 X = pd.read_csv(fname, header=None)
 np.random.seed(102)
 
-cluster = TICC(
+self = TICC(
     window_size=1,
     n_clusters=8,
     lambda_parameter=11e-2,
@@ -24,7 +24,7 @@ cluster = TICC(
     n_jobs=-1,
     verbose=1
 )
-self = cluster
-cluster.fit(X)
+
+self.fit(X[:-1000])
 
 
